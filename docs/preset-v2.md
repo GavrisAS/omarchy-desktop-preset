@@ -65,9 +65,18 @@ the parent's cell, between 0.05 and 0.95, including gap/border midpoints.
 
 `class` is an exact current/initial class match. `title_hint` is optional and may
 help disambiguate workspace-local candidates; it never serves as a persistent
-window identity. `argv` is an array passed directly to the process launcher;
-null means capture could not determine a command. `cwd` is an absolute path or
-null. A cold load requires usable argv for every non-Nautilus instance.
+window identity. Non-Nautilus instances can use an optional `desktop_id`, such
+as `sample-app.desktop`. Load resolves it in the current XDG data directories
+and launches the entry through GIO with no file or URL operands. When present,
+`desktop_id` takes precedence over `argv` and `cwd`; new desktop-entry captures
+set both to null. A missing or unusable entry causes a launch preflight error.
+
+`argv` is an array passed directly to the process launcher. `cwd` is an
+absolute path or null. A cold load of an instance without a desktop ID or
+Nautilus location requires usable argv. The command
+`desktop_preset launch set NAME ID DESKTOP_ID` validates the selected entry,
+creates a timestamped backup and atomically changes that instance's launch
+metadata. The workspace arrangement and other instances stay intact.
 
 For Nautilus, `uri` supplies the launch location and `argv` is replaced with
 `["nautilus", "--new-window", uri]`. `uri: null` means no folder was recorded;

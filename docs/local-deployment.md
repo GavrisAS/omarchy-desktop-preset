@@ -29,6 +29,11 @@ per-window selection, or supply `--location ADDRESS URI` for scripted overrides.
 Explicit recapture creates a backup and v2 snapshot without changing existing
 `autostart.conf` mappings.
 
+A v2 instance with a stale launch command can be updated in place with
+`desktop_preset launch set NAME ID DESKTOP_ID`. The command backs up the
+preset and keeps its geometry, instance IDs, Nautilus locations and autostart
+assignments.
+
 To remove the tool while preserving presets, run `./uninstall.sh` **without
 `--purge`**. To restore a prior installation from a backup, copy its project
 scripts back to `~/.local/bin/`, then restore its menu and autostart Lua files.

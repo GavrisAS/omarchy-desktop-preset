@@ -13,7 +13,7 @@ desktop_preset autostart set work -w 3
 
 New snapshots use **version 2**: separate IDs for every window, including identical
 classes and titles; a split tree with a ratio at each node; per-window floating
-geometry; argv arrays and optional Nautilus locations. See the [v2 format reference](docs/preset-v2.md) for an editable example.
+geometry, launch targets and optional Nautilus locations. See the [v2 format reference](docs/preset-v2.md) for an editable example.
 Existing text presets still load through the legacy reader, including the cross-workspace fix in
 [PR #1](https://github.com/laleshii/omarchy-desktop-preset/pull/1).
 
@@ -29,6 +29,8 @@ cwd. See [Nautilus locations](#nautilus-locations).
 Requirements: Omarchy 4+, Hyprland 0.56+ with Lua dispatches, Bash, jq, Python 3.
 Optional **PyGObject** (`python-gobject` on Arch) enables typed Nautilus D-Bus
 correlation, displayed-location verification and bounded remote availability checks.
+It also enables XDG desktop-entry capture and is required to load instances with
+a saved desktop file ID.
 Optional zenity/yad provide folder dialogs; the existing Omarchy input menu or a
 TTY supplies a path/URI prompt. No GUI packages are required or installed. No Python packages are installed
 by this project. Tested on Omarchy 4.5.0-3, Hyprland 0.56.2 and Nautilus 51.1.
@@ -70,7 +72,7 @@ desktop_preset inspect [-w 3]              # live addresses and verified known U
 desktop_preset save work [-w 3]
 desktop_preset save work --force --interactive # backup, then per-window recapture
 desktop_preset save work --non-interactive  # never prompt; unknown URI stays null
-desktop_preset validate work               # URI coverage and current fallback policy
+desktop_preset validate work               # desktop entries and Nautilus locations
 desktop_preset load work [-w 3]
 desktop_preset load work --dry-run
 desktop_preset clear [-w 3]                # asks before closing windows
@@ -86,6 +88,41 @@ that terminal should not be part of the saved arrangement.
 `--dry-run` launches, closes and moves no windows, and writes no preset or
 allocation journal. It describes the intended operations; it does not prove the
 apps can launch or the geometry can be realized.
+
+## Desktop-entry launches
+
+When save can identify an installed desktop entry, it records its XDG desktop
+file ID. Load resolves that ID again, so an AppImage update can change `Exec`
+without requiring a new capture. GIO handles quoting, field codes, working
+directory, terminal settings and D-Bus activation. The preset passes no file
+or URL operands to the entry.
+
+Capture checks GIO launch metadata against the window's process ancestry, then
+looks for a unique ID matching the current or initial class, a unique
+`StartupWMClass` match, or a desktop executable corroborated by AppImage
+runtime metadata. Display names and titles do not establish this association.
+If the match is ambiguous, save reports it and uses a stable process command
+when available. Temporary AppImage mount paths are excluded from new captures.
+
+To repair one previously saved instance without arranging the workspace again,
+find its ID with `desktop_preset show work` and run:
+
+```sh
+desktop_preset launch set work w2 sample-app.desktop
+desktop_preset validate work
+desktop_preset load work --dry-run
+```
+
+`launch set` makes a timestamped backup and updates only that instance's launch
+metadata. Keep the desktop file ID installed and its `Exec` or D-Bus service
+usable. If the entry disappears, becomes ambiguous or stops being executable,
+repair the entry or select its replacement ID with `launch set`.
+
+A desktop-entry launch needs one new matching window linked to the launched
+process, inherited launch metadata or the activated D-Bus owner. If a
+single-instance application only focuses an existing window, or an
+unrelated process of the same class opens a window, the launch stays unresolved
+and the pending journal prevents duplicate retries.
 
 ## Nautilus locations
 
@@ -229,7 +266,7 @@ Rectangles cannot reveal a unique hidden compositor tree for geometrically
 equivalent arrangements, such as a perfectly aligned 2×2 grid. In that case the
 tool reconstructs a deterministic compatible guillotine tree with the same
 rendered ordering and proportions. It does not claim to read Hyprland's private
-tree. Other apps' launch argv/cwd are best-effort process or desktop-entry data;
+tree. Direct launch argv/cwd are best-effort process data;
 a shared application process may not identify per-window launch arguments.
 Terminal shell sessions, jobs, command history, open files, and browser tabs are
 not restored. Review unusual application argv before relying on a cold login.

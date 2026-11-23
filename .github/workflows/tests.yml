@@ -4,14 +4,11 @@ permissions:
   contents: read
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: python3 -m unittest discover -s tests -v
+      - run: sudo apt-get update && sudo apt-get install -y jq python3-gi gir1.2-glib-2.0 dbus-daemon
+      - run: /usr/bin/python3 -m unittest discover -s tests -v
       - run: |
           for file in install.sh uninstall.sh bin/*; do
             if head -1 "$file" | grep -q bash; then bash -n "$file"; fi

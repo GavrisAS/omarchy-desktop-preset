@@ -9,7 +9,6 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
@@ -17,7 +16,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from uuid import uuid4
 
 
 def module_at(name, path):
@@ -195,6 +196,8 @@ def validate(data):
         if w.get('cwd') is not None and (not isinstance(w['cwd'], str) or
                                         not Path(w['cwd']).is_absolute()):
             raise PresetError(f'{ident}: cwd must be absolute or null')
+        if 'desktop_id' in w and (w['class'] == NAUTILUS or not valid_desktop_id(w['desktop_id'])):
+            raise PresetError(f'{ident}: invalid desktop_id')
         # A broken historical Nautilus URI is a recoverable load condition.
         if w.get('uri') is not None and w['class'] != NAUTILUS:
             normalize_uri(w['uri'])
@@ -501,46 +504,198 @@ class Runtime:
             yield
 
 
-def launch_info(c):
+def valid_desktop_id(value):
+    return (isinstance(value, str) and value.endswith('.desktop') and len(value) > 8 and
+            '/' not in value and not any(ord(c) < 32 for c in value))
+
+
+def process_chain(pid, keys=()):
+    """Read only requested launch metadata from the window process and its ancestors."""
+    while isinstance(pid, int) and pid > 1:
+        proc = Path('/proc') / str(pid)
+        try:
+            stat = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+            parent, start = int(stat[1]), stat[19]
+        except (OSError, ValueError, IndexError):
+            return
+        env = {}
+        if keys:
+            try:
+                for item in (proc / 'environ').read_bytes().split(b'\0'):
+                    key, _, value = item.partition(b'=')
+                    if key in keys:
+                        env[key] = os.fsdecode(value)
+            except OSError:
+                pass
+        yield (pid, start), env
+        pid = parent
+
+
+class DesktopEntries:
+    """Resolve XDG IDs and delegate launch semantics to GIO."""
+    def __init__(self):
+        self.api = None
+        try:
+            from gi.repository import Gio, GLib
+            try:
+                from gi.repository import GioUnix
+                self.api = GioUnix.DesktopAppInfo
+            except (ImportError, ValueError, AttributeError):
+                self.api = Gio.DesktopAppInfo
+            self.gio, self.glib = Gio, GLib
+        except (ImportError, ValueError, AttributeError):
+            pass
+        self.paths = None
+
+    def get(self, ident):
+        if not self.api:
+            raise PresetError('desktop-entry launches require PyGObject with GIO (python-gobject on Arch)')
+        if self.paths is None:
+            self.paths = {}
+            user = os.environ.get('XDG_DATA_HOME') or str(Path.home() / '.local/share')
+            system = os.environ.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share'
+            for data in (user, *system.split(':')):
+                directory = Path(data) / 'applications'
+                if directory.is_absolute():
+                    entries = {}
+                    for path in directory.rglob('*.desktop'):
+                        if path.is_file():
+                            key = path.relative_to(directory).as_posix().replace('/', '-')
+                            entries.setdefault(key, []).append(path)
+                    for key, paths in entries.items():
+                        self.paths.setdefault(key, paths)
+        paths = self.paths.get(ident, [])
+        if len(paths) > 1:
+            raise PresetError(f'desktop entry {ident!r} has multiple files with the same XDG ID')
+        try:
+            app = self.api.new(ident) if paths else None
+        except TypeError:  # PyGObject raises when the constructor returns NULL.
+            app = None
+        if not app or Path(app.get_filename()) != paths[0] or app.get_is_hidden():
+            raise PresetError(f'desktop entry {ident!r} is missing, hidden or unusable; '
+                              'check its Exec and TryExec')
+        return app
+
+    def unique_id(self, apps):
+        ids = {app.get_id() for app in apps}
+        if len(ids) > 1:
+            raise PresetError('ambiguous desktop entries: ' + ', '.join(sorted(ids)))
+        if ids:
+            ident = ids.pop()
+            self.get(ident)
+            return ident
+        return None
+
+    def appimage_source(self, c, chain, apps):
+        if not chain:
+            return None
+        env = chain[0][1]
+        appdir, source = env.get(b'APPDIR'), env.get(b'APPIMAGE')
+        if not appdir or not source or not Path(source).is_absolute():
+            return None
+        try:
+            if not Path(os.readlink(f'/proc/{c["pid"]}/exe')).is_relative_to(appdir):
+                return None
+        except OSError:
+            return None
+        matches = []
+        for app in apps:
+            # Metadata comparison only. GIO expands and executes Exec at load time.
+            try:
+                _, argv = self.glib.shell_parse_argv(app.get_commandline() or '')
+                if argv and argv[0] == source:
+                    matches.append(app)
+            except self.glib.Error:
+                continue
+        return self.unique_id(matches)
+
+    def identify(self, c):
+        if not self.api:
+            return None
+        chain = list(process_chain(c.get('pid'), (b'GIO_LAUNCHED_DESKTOP_FILE',
+                                                   b'GIO_LAUNCHED_DESKTOP_FILE_PID',
+                                                   b'APPIMAGE', b'APPDIR')))
+        paths = {env[b'GIO_LAUNCHED_DESKTOP_FILE'] for (pid, _), env in chain
+                 if b'GIO_LAUNCHED_DESKTOP_FILE' in env and
+                 env.get(b'GIO_LAUNCHED_DESKTOP_FILE_PID') == str(pid)}
+        # Only match installed entries. Inherited GIO metadata from an unrelated
+        # launcher is excluded unless its PID is still in the process chain.
+        apps = self.api.get_all()
+        classes = {value for value in (c['class'], c.get('initialClass')) if value}
+        folded = {value.casefold() for value in classes}
+        return (self.unique_id(a for a in apps if a.get_filename() in paths) or
+                self.unique_id(a for a in apps if a.get_id().removesuffix('.desktop') in classes) or
+                self.unique_id(a for a in apps if a.get_id().removesuffix('.desktop').casefold() in folded) or
+                self.unique_id(a for a in apps if (a.get_startup_wm_class() or '').casefold() in folded) or
+                self.appimage_source(c, chain, apps))
+
+    def launch(self, app, token):
+        context = self.gio.AppLaunchContext()
+        context.setenv('DESKTOP_PRESET_LAUNCH_TOKEN', token)
+        spawned = set()
+
+        def launched(_context, _app, details):
+            pid = details.lookup_value('pid', None)
+            if pid is not None:
+                process = next(process_chain(pid.unpack()), None)
+                if process:
+                    spawned.add(process[0])
+
+        context.connect('launched', launched)
+        try:
+            # Login captures CLI output. A GUI process must not retain its pipes.
+            with open(os.devnull, 'r+b') as stdio:
+                fd = stdio.fileno()
+                if not app.launch_uris_as_manager_with_fds(
+                        [], context, self.glib.SpawnFlags.DEFAULT, None, None, None, None, fd, fd, fd):
+                    raise PresetError('GIO could not launch the desktop entry')
+        except self.glib.Error as exc:
+            raise PresetError(str(exc)) from exc
+        return spawned
+
+    def owner_pid(self, app):
+        if not app.get_boolean('DBusActivatable'):
+            return None
+        try:
+            bus = self.gio.bus_get_sync(self.gio.BusType.SESSION, None)
+            return bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                                 'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+                                 self.glib.Variant('(s)', (app.get_id().removesuffix('.desktop'),)),
+                                 None, self.gio.DBusCallFlags.NO_AUTO_START, 700, None).unpack()[0]
+        except self.glib.Error:
+            return None
+
+
+def transient_appimage_path(value):
+    return value.endswith(' (deleted)') or any(part.startswith('.mount_') for part in Path(value).parts)
+
+
+def launch_info(c, desktop):
     cls = c['class']
     if cls == NAUTILUS:
-        return ['nautilus', '--new-window'], None
+        return {'argv': ['nautilus', '--new-window'], 'cwd': None}
     if cls.startswith('chrome-') and '__' in cls:
-        return ['omarchy-launch-webapp', 'https://' + cls[7:].split('__')[0] + '/'], None
+        return {'argv': ['omarchy-launch-webapp', 'https://' + cls[7:].split('__')[0] + '/'], 'cwd': None}
     if cls.startswith('org.omarchy.'):
-        return ['omarchy-launch-tui', cls[len('org.omarchy.'):]], None
+        return {'argv': ['omarchy-launch-tui', cls[len('org.omarchy.'):]], 'cwd': None}
+    try:
+        ident = desktop.identify(c)
+        if ident:
+            return {'desktop_id': ident, 'argv': None, 'cwd': None}
+    except PresetError as exc:
+        warn(f'{cls}: {exc}')
     try:
         proc = Path('/proc') / str(c['pid'])
         argv = [os.fsdecode(a) for a in (proc / 'cmdline').read_bytes().rstrip(b'\0').split(b'\0')]
-        if argv and Path(argv[0]).is_file() and os.access(argv[0], os.X_OK):
+        exe = os.readlink(proc / 'exe')
+        executable = Path(argv[0])
+        if (executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK)
+                and not any(transient_appimage_path(p) for p in (argv[0], exe))):
             cwd = os.readlink(proc / 'cwd')
-            # A terminal's shell/session is not recreated. Its process argv is data.
-            return argv, cwd if Path(cwd).is_dir() else None
+            return {'argv': argv, 'cwd': cwd if not transient_appimage_path(cwd) and Path(cwd).is_dir() else None}
     except (KeyError, OSError):
         pass
-    dirs = [Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'applications',
-            Path('/usr/share/applications')]
-    for directory in dirs:
-        files = sorted(directory.glob('*.desktop'), key=lambda p: p.stem.lower() != cls.lower())
-        for file in files:
-            section = False
-            values = {}
-            for line in file.read_text(errors='replace').splitlines():
-                if line.startswith('['):
-                    section = line == '[Desktop Entry]'
-                elif section and '=' in line:
-                    key, value = line.split('=', 1)
-                    values[key] = value
-            if file.stem.lower() != cls.lower() and values.get('StartupWMClass', '').lower() != cls.lower():
-                continue
-            try:
-                argv = [a.replace('%%', '%') for a in shlex.split(values.get('Exec', ''))
-                        if not re.fullmatch(r'%[A-Za-z]', a)]
-            except ValueError:
-                continue
-            if argv:
-                return argv, None
-    return None, None
+    return {'argv': None, 'cwd': None}
 
 
 def record(w, c):
@@ -570,14 +725,14 @@ def save(path, ws, force, overrides, hypr, runtime, nautilus, picker=None):
     bindings, snapshot = capture_locations(hypr, runtime, nautilus) if any(
         c['class'] == NAUTILUS for c in clients) else ({}, None)
     picker = picker or LocationPicker(hypr, False)
+    desktop = DesktopEntries()
     windows, journal = [], {}
     for index, c in enumerate(clients, 1):
         if c.get('fullscreen') or c.get('grouped'):
             raise PresetError('fullscreen/grouped windows are unsupported; leave that mode before saving')
         ident = f'w{index}'
-        argv, cwd = launch_info(c)
         w = {'id': ident, 'class': c['class'], 'title_hint': c.get('title', ''),
-             'argv': argv, 'cwd': cwd, 'floating': c['floating'], 'rect': c['at'] + c['size']}
+             **launch_info(c, desktop), 'floating': c['floating'], 'rect': c['at'] + c['size']}
         if c['class'] == NAUTILUS:
             binding = bindings.get(c['address'])
             uri = overrides.get(c['address']) or explicit_location(runtime, c)
@@ -609,8 +764,9 @@ def save(path, ws, force, overrides, hypr, runtime, nautilus, picker=None):
                 warn(f'{ident} ({c["address"]}): active Nautilus location unavailable; '
                      'saved as null; load will open a separate Home window. '
                      'Recapture with save --force --interactive or use --location ADDRESS URI')
-        if argv is None:
-            warn(f'{ident}: launch argv unavailable; edit argv before cold loading')
+        if not w.get('argv') and not w.get('desktop_id'):
+            warn(f'{ident}: stable launch target unavailable; use launch set NAME {ident} DESKTOP_ID '
+                 'or edit argv before cold loading')
         windows.append(w)
         journal[ident] = record(w, c)
         print(f'{ident}: {c["address"]} {c["class"]}')
@@ -656,9 +812,19 @@ class Loader:
         self.timeout = timeout
         self.wait = 0.1
         self.processes = []
+        self.desktop = DesktopEntries()
+        self.desktop_apps = {}
 
     def uri(self, c, snapshot):
         return self.n.location(snapshot, self.rt.binding(c))
+
+    def desktop_app(self, w):
+        if w['id'] not in self.desktop_apps:
+            try:
+                self.desktop_apps[w['id']] = self.desktop.get(w['desktop_id'])
+            except PresetError as exc:
+                raise PresetError(f'{w["id"]}: {exc}; see desktop_preset launch set') from exc
+        return self.desktop_apps[w['id']]
 
     def plan(self, data, path, ws):
         clients = self.h.clients()
@@ -694,6 +860,9 @@ class Loader:
         # Preflight all reuse before mutations. Exact-class/title matching is
         # only a hint, never a persistent identity for indistinguishable windows.
         for w in unresolved:
+            if 'desktop_id' in w:
+                # Class alone does not identify a preexisting desktop-entry instance.
+                continue
             candidates = [c for c in local if c['address'] not in consumed and matches(w, c)]
             if w['class'] == NAUTILUS:
                 candidates = [c for c in candidates if uri_equal(self.uri(c, snapshot), w.get('uri'))]
@@ -727,25 +896,33 @@ class Loader:
                                   'load --retry-pending explicitly')
             if w['class'] == NAUTILUS:
                 pass  # Locations were resolved independently, with per-instance Home fallback.
+            elif 'desktop_id' in w:
+                self.desktop_app(w)
             elif not w.get('argv'):
-                raise PresetError(f'{w["id"]}: launch argv unavailable; edit the preset')
-            if w['class'] != NAUTILUS and w.get('cwd') and not Path(w['cwd']).is_dir():
+                raise PresetError(f'{w["id"]}: launch target unavailable; use launch set or edit argv')
+            elif w.get('cwd') and not Path(w['cwd']).is_dir():
                 raise PresetError(f'{w["id"]}: launch cwd unavailable')
         return selected, state
 
     def launch(self, w, ws, state, persist):
         before = {c['address'] for c in self.h.clients()}
         dbus_before = self.n.snapshot() if w['class'] == NAUTILUS else None
-        argv = ['nautilus', '--new-window', w['uri']] if w['class'] == NAUTILUS else w['argv']
+        app = self.desktop_app(w) if 'desktop_id' in w else None
+        argv = ['nautilus', '--new-window', w['uri']] if w['class'] == NAUTILUS else w.get('argv')
         state['instances'][w['id']] = {'pending': True, 'before': sorted(before)}
         persist()
-        print(f'Launch {w["id"]}: {shlex.join(argv)}')
+        token = uuid4().hex if app else None
         try:
-            proc = subprocess.Popen(argv, cwd=w.get('cwd'), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=True)
-            self.processes.append(proc)
-        except OSError as exc:
+            if app:
+                print(f'Launch {w["id"]}: desktop entry {w["desktop_id"]}')
+                spawned = self.desktop.launch(app, token)
+            else:
+                print(f'Launch {w["id"]}: {shlex.join(argv)}')
+                proc = subprocess.Popen(argv, cwd=w.get('cwd'), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+                self.processes.append(proc)
+        except (OSError, PresetError) as exc:
             state['instances'].pop(w['id'])
             persist()
             raise PresetError(f'{w["id"]}: launch failed: {exc}') from exc
@@ -755,6 +932,12 @@ class Loader:
         verified = False
         while time.monotonic() < deadline:
             candidates = [c for c in self.h.clients() if c['address'] not in before and matches(w, c)]
+            if app and candidates:
+                owner = self.desktop.owner_pid(app)
+                candidates = [c for c in candidates if any(
+                    identity in spawned or identity[0] == owner or
+                    env.get(b'DESKTOP_PRESET_LAUNCH_TOKEN') == token
+                    for identity, env in process_chain(c.get('pid'), (b'DESKTOP_PRESET_LAUNCH_TOKEN',)))]
             if len(candidates) > 1:
                 raise PresetError(f'{w["id"]}: multiple new matching windows; refusing an unproven association')
             if candidates:
@@ -811,6 +994,7 @@ class Loader:
     def load(self, path, ws, dry=False, retry=False, clear=False, yes=False):
         data = validate(read_json(path))
         self.fallbacks = {}
+        self.desktop_apps.clear()
         for w in data['windows']:
             if w['class'] == NAUTILUS:
                 w['uri'], reason = effective_location(w.get('uri'))
@@ -822,6 +1006,12 @@ class Loader:
         self.h.check_policy()
         workarea = self.h.context(ws)
         key = self.rt.key(path, ws)
+        if dry or clear:
+            for w in data['windows']:
+                if 'desktop_id' in w:
+                    self.desktop_app(w)
+                    if dry:
+                        print(f'{w["id"]}: desktop entry {w["desktop_id"]} available')
         if dry:
             print(f'Would reconcile {len(data["windows"])} distinct instances on workspace {ws}; '
                   'stage, replay splits and verify rectangles. No launches or dispatches.')
@@ -974,6 +1164,33 @@ def location_report(data):
           'Missing locations are recoverable; validation does not change the preset.')
 
 
+def update_instance(path, data, runtime, ident, explicit_uri=None):
+    old_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
+    backup(path)
+    atomic_json(path, validate(data))
+    new_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
+    for key, state in list(runtime.data['loads'].items()):
+        if key.startswith(old_prefix):
+            runtime.data['loads'][new_prefix + key[len(old_prefix):]] = state
+            entry = state['instances'].get(ident, {})
+            if explicit_uri and entry.get('address'):
+                runtime.data.setdefault('explicit', {})[entry['address']] = {
+                    'fingerprint': entry.get('fingerprint'), 'uri': explicit_uri}
+    runtime.persist()
+
+
+def set_desktop_launch(path, ident, desktop_id, runtime):
+    if not valid_desktop_id(desktop_id):
+        raise PresetError('supply an installed desktop file ID including the .desktop suffix')
+    data = validate(read_json(path))
+    w = next((w for w in data['windows'] if w['id'] == ident), None)
+    if not w or w['class'] == NAUTILUS:
+        raise PresetError('no eligible non-Nautilus instance with that ID')
+    DesktopEntries().get(desktop_id)
+    w.update(desktop_id=desktop_id, argv=None, cwd=None)
+    update_instance(path, data, runtime, ident)
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '_probe-uri':
         try:
@@ -985,7 +1202,7 @@ def main():
         except Exception:
             return 2
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['save', 'load', 'location', 'inspect', 'validate'])
+    parser.add_argument('action', choices=['save', 'load', 'location', 'launch', 'inspect', 'validate'])
     parser.add_argument('name', nargs='?')
     parser.add_argument('extra', nargs='*')
     parser.add_argument('-w', '--workspace', type=int)
@@ -1003,11 +1220,11 @@ def main():
     args = parser.parse_args()
     directory = Path(os.environ.get('DESKTOP_PRESET_DIR', Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'desktop_preset'))
     hypr, runtime, nautilus = Hypr(), Runtime(), Nautilus()
-    if args.action == 'location':
-        # CLI: location set NAME ID URI (kept positional to simplify shell forwarding).
+    if args.action in ('location', 'launch'):
         if args.name != 'set' or len(args.extra) != 3:
-            raise PresetError('usage: desktop_preset location set NAME INSTANCE_ID URI')
-        name, ident, uri = args.extra
+            target = 'URI' if args.action == 'location' else 'DESKTOP_ID'
+            raise PresetError(f'usage: desktop_preset {args.action} set NAME INSTANCE_ID {target}')
+        name, ident, value = args.extra
     else:
         name = args.name
     if args.action != 'inspect' and (not name or not re.fullmatch(r'[A-Za-z0-9_-]+', name)):
@@ -1018,29 +1235,31 @@ def main():
             print('Legacy v1 preset: no per-instance URI coverage; load uses the legacy reader. '
                   'Arrange windows and save --force to explicitly recapture v2.')
         else:
-            location_report(validate(read_json(path)))
+            data = validate(read_json(path))
+            location_report(data)
+            desktop = DesktopEntries()
+            for w in data['windows']:
+                if 'desktop_id' in w:
+                    try:
+                        desktop.get(w['desktop_id'])
+                    except PresetError as exc:
+                        raise PresetError(f'{w["id"]}: {exc}; see desktop_preset launch set') from exc
+                    print(f'{w["id"]}: desktop entry {w["desktop_id"]} available')
         return
     with runtime.lock():
+        if args.action == 'launch':
+            set_desktop_launch(path, ident, value, runtime)
+            print(f'Desktop entry set for {name}/{ident}.')
+            return
         if args.action == 'location':
             data = validate(read_json(path))
-            old_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
             w = next((w for w in data['windows'] if w['id'] == ident and w['class'] == NAUTILUS), None)
             if not w:
                 raise PresetError('no Nautilus instance with that ID (legacy presets must be recaptured explicitly)')
-            w['uri'] = normalize_uri(uri)
+            w['uri'] = normalize_uri(value)
             w['location_source'] = 'explicit'
             w['location_confidence'] = 'user-confirmed'
-            backup(path)
-            atomic_json(path, data)
-            new_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
-            for key, state in list(runtime.data['loads'].items()):
-                if key.startswith(old_prefix):
-                    runtime.data['loads'][new_prefix + key[len(old_prefix):]] = state
-                    entry = state['instances'].get(ident, {})
-                    if entry.get('address'):
-                        runtime.data.setdefault('explicit', {})[entry['address']] = {
-                            'fingerprint': entry.get('fingerprint'), 'uri': w['uri']}
-            runtime.persist()
+            update_instance(path, data, runtime, ident, explicit_uri=w['uri'])
             print(f'Location set for {name}/{ident}.')
             return
         ws = args.workspace if args.workspace is not None else hypr.query('activeworkspace')['id']

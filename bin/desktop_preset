@@ -13,7 +13,7 @@ set -uo pipefail
 # Keep the legacy reader intact; new snapshots use a typed instance schema.
 V2="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/desktop-preset-v2"
 case ${1:-} in
-  save|location|inspect|validate) exec python3 "$V2" "$@" ;;
+  save|location|launch|inspect|validate) exec python3 "$V2" "$@" ;;
 esac
 
 DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
@@ -43,8 +43,9 @@ usage:
   desktop_preset clear [options]          close windows on a workspace
   desktop_preset edit <name>              open a preset in $EDITOR
   desktop_preset inspect [-w N]          show instance addresses and known URIs
-  desktop_preset validate NAME           report URI coverage and Home fallback
+  desktop_preset validate NAME           check desktop entries and Nautilus locations
   desktop_preset location set NAME ID URI  set a v2 Nautilus instance location
+  desktop_preset launch set NAME ID DESKTOP_ID  set a v2 instance desktop entry
   desktop_preset autostart list [--raw]   show which workspace loads what at login
   desktop_preset autostart set <name> -w N    auto-load <name> on workspace N at login
   desktop_preset autostart unset -w N     stop auto-loading on workspace N
