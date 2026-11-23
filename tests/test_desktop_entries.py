@@ -348,9 +348,9 @@ class DesktopRestoreTests(unittest.TestCase):
                          ['nautilus', '--new-window'])
         self.desktop.identify.assert_not_called()
         self.desktop.identify.return_value = None
-        with subprocess.Popen([shutil.which('sleep'), '30'], cwd=self.root) as proc:
-            try:
-                self.assertEqual(v2.launch_info({'class': CLASS, 'pid': proc.pid}, self.desktop),
-                                 {'argv': [shutil.which('sleep'), '30'], 'cwd': str(self.root)})
-            finally:
-                proc.terminate()
+        argv = [shutil.which('sh'), '-c', 'printf "ready\\n"; read -r line']
+        with subprocess.Popen(argv, cwd=self.root, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True) as proc:
+            self.assertEqual(proc.stdout.readline(), 'ready\n')
+            self.assertEqual(v2.launch_info({'class': CLASS, 'pid': proc.pid}, self.desktop),
+                             {'argv': argv, 'cwd': str(self.root)})
