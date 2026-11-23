@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -52,14 +53,19 @@ class GioTests(unittest.TestCase):
             env={**os.environ, 'XDG_DATA_HOME': str(self.apps.parent),
                  'XDG_DATA_DIRS': str(self.system.parent), 'RESULT': str(self.result),
                  'PYTHONPATH': str(ROOT / 'tests'), **env},
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=8, check=True)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=8, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
     def wait_for_result(self):
         deadline = time.monotonic() + 3
-        while not self.result.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if self.result.exists():
+                lines = self.result.read_text().splitlines()
+                if lines:
+                    return lines
             time.sleep(.02)
-        return self.result.read_text().splitlines()
+        self.fail('launched application did not write a result')
 
     def test_mount_process_saves_desktop_identity_and_resolves_updated_exec(self):
         self.entry(options=f'StartupWMClass={CLASS}\n')
@@ -184,8 +190,8 @@ except v2.PresetError as exc:
         try:
             self.run_gio("d = v2.DesktopEntries(); d.launch(d.get(ID), 'sample-token')")
         finally:
-            if self.result.exists():
-                os.kill(int(self.result.read_text()), 15)
+            pid, = self.wait_for_result()
+            os.kill(int(pid), signal.SIGTERM)
 
     @unittest.skipUnless(shutil.which('dbus-run-session'), 'dbus-run-session unavailable')
     def test_dbus_activation_uses_service_and_resolves_owner(self):

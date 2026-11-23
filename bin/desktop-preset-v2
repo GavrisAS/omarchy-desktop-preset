@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
@@ -536,12 +537,18 @@ class DesktopEntries:
     def __init__(self):
         self.api = None
         try:
+            import gi
             from gi.repository import Gio, GLib
             try:
+                # Older PyGObject must register this GType from Gio first.
+                # Current PyGObject forwards the legacy name to GioUnix.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message=r'Gio\.DesktopAppInfo is deprecated')
+                    self.api = Gio.DesktopAppInfo
+            except AttributeError:
+                gi.require_version('GioUnix', '2.0')
                 from gi.repository import GioUnix
                 self.api = GioUnix.DesktopAppInfo
-            except (ImportError, ValueError, AttributeError):
-                self.api = Gio.DesktopAppInfo
             self.gio, self.glib = Gio, GLib
         except (ImportError, ValueError, AttributeError):
             pass
